@@ -7,4 +7,9 @@ module.exports = {
   dataDir: __dirname + '/../data',
   allowlistFile: __dirname + '/../data/allowlist.json',
   indexFile: __dirname + '/../data/index.json',
+  aiFile: __dirname + '/../data/ai.json',
+  // providers: 'gemini' | 'openai' | 'local'
+  aiProvider: process.env.AI_PROVIDER || 'gemini',
+  geminiApiKey: process.env.GEMINI_API_KEY || null,
+  openaiApiKey: process.env.OPENAI_API_KEY || null,
 };

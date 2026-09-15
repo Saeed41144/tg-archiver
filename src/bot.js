@@ -3,7 +3,7 @@ const cfg = require('./config');
 const allowlist = require('./storage/allowlist');
 const channel = require('./storage/channel');
 const index = require('./storage/index');
-const { classify } = require('./classifier/ai');
+const ai = require('./classifier/ai');
 const registry = require('./agents/registry');
 
 if (!cfg.token || cfg.token === 'REPLACE_ME') {
@@ -35,12 +35,12 @@ async function reply(chatId, text, parse = 'Markdown', keyboard) {
 }
 
 function extractFileId(msg) {
-  const d = msg.document || msg.photo && msg.photo[msg.photo.length - 1];
+  const d = msg.document || (msg.photo && msg.photo[msg.photo.length - 1]);
   if (!d) return null;
   return d.file_id;
 }
 function extractMime(msg) {
-  return (msg.document && msg.document.mime_type) || 'image';
+  return (msg.document && msg.document.mime_type) || 'image/jpeg';
 }
 function extractName(msg) {
   return (msg.document && msg.document.file_name) || 'photo';
@@ -82,32 +82,115 @@ async function handleListUsers(msg) {
   reply(msg.chat.id, `👑 *Owners:*\n${fmt(l.owners)}\n\n👤 *Users:*\n${fmt(l.users)}`);
 }
 
+// ---------- AI key management (owner) ----------
+async function handleSetAi(msg, args) {
+  if (!guardOwner(msg)) return reply(msg.chat.id, '⛔ فقط مالک.');
+  const text = (args || '').trim();
+
+  if (!text) {
+    const has = ai.hasAi();
+    reply(msg.chat.id, has
+      ? '🤖 *کلید هوش مصنوعی تنظیم شده است.*\nبرای تغییر: `/setai <کلید>`\nحذف: `/setai off`'
+      : '🤖 برای فعال‌سازی تشخیص خودکار، ابتدا یک کلید AI اضافه کن:\n\n`/setai <کلید Gemini>`  (پیش‌فرض)\n`/setai openai <کلید>`  (OpenAI)\n\nکلید در data/ai.json ذخیره می‌شود و در GitHub نمی‌رود.');
+    return;
+  }
+
+  if (text === 'off') {
+    ai.writeAi({});
+    reply(msg.chat.id, '🗑️ کلید AI حذف شد. تشخیص با نام فایل عمل می‌کند.');
+    return;
+  }
+
+  if (text.startsWith('openai ')) {
+    const key = text.slice('openai '.length).trim();
+    if (!key) return reply(msg.chat.id, 'استفاده: `/setai openai <کلید>`');
+    ai.writeAi({ openaiKey: key, geminiKey: ai.getAiKey() });
+    reply(msg.chat.id, '✅ کلید OpenAI ذخیره شد.');
+    return;
+  }
+
+  ai.writeAi({ geminiKey: text, openaiKey: ai.getOpenAiKey() });
+  reply(msg.chat.id, '✅ کلید هوش مصنوعی (Gemini) ذخیره شد. از این پس فایل‌ها خودکار طبقه‌بندی می‌شوند.');
+}
+
+// ---------- AI analysis of an image ----------
+async function analyzePhoto(bot, msg) {
+  const fileId = extractFileId(msg);
+  if (!fileId) return;
+  if (!ai.hasAi()) {
+    return reply(msg.chat.id, '🤖 ابتدا کلید AI را تنظیم کن: `/setai <کلید Gemini>`');
+  }
+  reply(msg.chat.id, '🤖 در حال تحلیل تصویر با هوش مصنوعی...');
+  try {
+    const file = await bot.getFile(fileId);
+    const mimeType = extractMime(msg);
+    const url = `https://api.telegram.org/file/bot${cfg.token}/${file.file_path}`;
+    const res = await fetch(url);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const b64 = buf.toString('base64');
+    const result = await ai.classify(b64, mimeType, extractName(msg));
+    const catLine = result.category ? `\n🏷️ دسته: #${result.category}` : '';
+    const descLine = result.description ? `\n📝 توضیح: _${result.description}_` : '';
+    reply(msg.chat.id, `🔍 *نتیجه تحلیل:*${catLine}${descLine}`);
+  } catch (e) {
+    reply(msg.chat.id, '❌ خطا در تحلیل تصویر.');
+  }
+}
+
 // ---------- media / archive ----------
 async function handleMedia(msg) {
   if (!guardAllowed(msg)) return reply(msg.chat.id, '⛔ شما مجاز نیستید.');
   const fileId = extractFileId(msg);
   if (!fileId) return;
 
+  // If the caption is /analyze, analyze instead of archive.
+  if (msg.caption && msg.caption.trim().startsWith('/analyze')) {
+    return analyzePhoto(bot, msg);
+  }
+
   const caption = msg.caption || msg.text || '';
-  let category = 'سایر';
+  const filename = extractName(msg);
+
+  // Download the image for AI classification.
+  let imageBase64 = null;
+  let mimeType = extractMime(msg);
+  const isImage = /^image\//.test(mimeType);
   try {
-    category = await classify(null, extractName(msg));
+    if (isImage) {
+      const file = await bot.getFile(fileId);
+      const url = `https://api.telegram.org/file/bot${cfg.token}/${file.file_path}`;
+      const res = await fetch(url);
+      const buf = Buffer.from(await res.arrayBuffer());
+      imageBase64 = buf.toString('base64');
+    }
+  } catch (e) { /* image download optional */ }
+
+  let category = 'سایر';
+  let aiDesc = '';
+  try {
+    const cl = await ai.classify(imageBase64, mimeType, filename);
+    category = cl.category || 'سایر';
+    aiDesc = cl.description || '';
   } catch (e) {}
+
+  const tags = category ? [category] : [];
 
   try {
     const rec = await channel.archiveFile(bot, {
       fileId,
-      mimeType: extractMime(msg),
+      mimeType,
       caption,
       category,
-      tags: [category],
+      tags,
       userId: msg.from.id,
-      filename: extractName(msg),
+      filename,
+      chatPhoto: isImage,
     });
     const ref = rec.messageId;
+    const aiLine = aiDesc && aiDesc !== category ? `\n🤖 ${aiDesc}` : (ai.hasAi() && category !== 'سایر' ? '\n🤖 تشخیص خودکار' : '');
     reply(
       msg.chat.id,
-      `✅ ذخیره شد. (#${category})\nشناسه: \`${ref}\`\nبرای دریافت: دکمه زیر 👇`,
+      `✅ ذخیره شد. (#${category})${aiLine}\nشناسه: \`${ref}\`\nبرای دریافت: دکمه زیر 👇`,
       'Markdown',
       savedKeyboard(ref)
     );
@@ -116,7 +199,7 @@ async function handleMedia(msg) {
   }
 }
 
-// ---------- get / search ----------
+// ---------- get / search / agents ----------
 async function handleGet(msg, args) {
   if (!guardAllowed(msg)) return reply(msg.chat.id, '⛔ شما مجاز نیستید.');
   const id = Number((args || '').trim());
@@ -142,19 +225,43 @@ function handleSearch(msg, args) {
   reply(msg.chat.id, `🔍 *نتایج:*\n${text}\n\nبرای دریافت: \`/get <شناسه>\``);
 }
 
+function handleAgents(msg, args) {
+  if (!guardAllowed(msg)) return reply(msg.chat.id, '⛔ شما مجاز نیستید.');
+  registry.initDefaultAgents();
+  const q = (args || '').trim();
+  if (!q) {
+    const list = registry.list().map((a) => `• ${a.name} — ${a.description}`).join('\n');
+    reply(msg.chat.id, `🤖 *ایجنت‌های متصل:*\n\n${list}\n\nبرای جستجو با ایجنت: \`/agents <عبارت>\``);
+    return;
+  }
+  const results = registry.dispatch(q);
+  if (!results.length) {
+    reply(msg.chat.id, `🤖 ایجنت برای «${q}» چیزی پیدا نکرد.`);
+    return;
+  }
+  const text = results.slice(0, 8).map((r) =>
+    `• \`${r.messageId}\` #${r.category} — ${r.caption || ''} (${new Date(r.timestamp).toLocaleDateString('fa-IR')})`
+  ).join('\n');
+  reply(msg.chat.id, `🤖 *ایجنت نتایج «${q}»:*\n\n${text}\n\nبرای دریافت: /get <شناسه>`);
+}
+
 function handleStats(msg) {
   if (!guardAllowed(msg)) return reply(msg.chat.id, '⛔ شما مجاز نیستید.');
   const s = index.stats();
-  const lines = Object.entries(s.byCat).map(([c, n]) => `• #${c}: ${n}`).join('\n');
+  const lines = Object.entries(s.byCat).map(([c, n]) => `•${c}: ${n}`).join('\n');
   reply(msg.chat.id, `📊 *آرشیو:* ${s.total} فایل\n\n${lines || '—'}`);
 }
 
 // ---------- start / help ----------
 function handleHelp(msg, customText) {
+  const hasAi = ai.hasAi();
+  const aiLine = hasAi ? '✅ فعال' : '❌ غیرفعال (برای فعال‌سازی: /setai)';
   const help = [
-    '🤖 *ربات آرشیو*',
+    '🤖 *ربات آرشیو عکس و فایل*',
     '',
-    '▪️ عکس/فایل بفرست → خودکار دسته‌بندی و در کانال ذخیره می‌شود',
+    '▪️ عکس/فایل بفرست → خودکار دسته‌بندی و در زیرگروه‌های کانال ذخیره می‌شود',
+    '',
+    `▪️ 🤖 *هوش مصنوعی:* ${aiLine}`,
     '',
     '*منوی اصلی:*',
     'از دکمه‌های زیر استفاده کن ⬇️',
@@ -166,10 +273,11 @@ function handleHelp(msg, customText) {
 function mainMenuKeyboard(msg) {
   const rows = [
     [{ text: '🔍 جستجو', callback_data: 'menu_search' }, { text: '📊 آمار', callback_data: 'menu_stats' }],
-    [{ text: '📚 دسته‌بندی‌ها', callback_data: 'menu_categories' }],
+    [{ text: '🤖 ایجنت‌ها', callback_data: 'menu_agents' }, { text: '📚 دسته‌بندی‌ها', callback_data: 'menu_categories' }],
   ];
   if (guardOwner(msg)) {
     rows.push([
+      { text: '🤖 تنظیم AI', callback_data: 'menu_setai' },
       { text: '👥 کاربران', callback_data: 'menu_users' },
     ]);
   }
@@ -199,12 +307,7 @@ function savedKeyboard(messageId) {
 }
 
 function usersKeyboard() {
-  const l = allowlist.list();
-  return {
-    inline_keyboard: [
-      [{ text: '🏠 بازگشت', callback_data: 'menu_back' }],
-    ],
-  };
+  return { inline_keyboard: [[{ text: '🏠 بازگشت', callback_data: 'menu_back' }]] };
 }
 
 // ---------- router ----------
@@ -217,8 +320,10 @@ bot.on('message', async (msg) => {
     if (isCommand(text, 'adduser')) return handleAddUser(msg, text.slice('/adduser'.length));
     if (isCommand(text, 'removeuser')) return handleRemoveUser(msg, text.slice('/removeuser'.length));
     if (isCommand(text, 'listusers')) return handleListUsers(msg);
+    if (isCommand(text, 'setai')) return handleSetAi(msg, text.slice('/setai'.length));
     if (isCommand(text, 'get')) return handleGet(msg, text.slice('/get'.length));
     if (isCommand(text, 'search')) return handleSearch(msg, text.slice('/search'.length));
+    if (isCommand(text, 'agents')) return handleAgents(msg, text.slice('/agents'.length));
     if (isCommand(text, 'stats')) return handleStats(msg);
   } catch (e) {
     reply(chatId, '❌ خطای داخلی.');
@@ -229,16 +334,7 @@ bot.on('message', async (msg) => {
     await handleMedia(msg);
     return;
   }
-
-  // ignored text
-  if (text && !isCommand(text, 'start') && !isCommand(text, 'help') && !isAllowedAny(msg)) {
-    // nothing, just silence
-  }
 });
-
-function isAllowedAny(msg) {
-  return allowlist.isAllowed(msg.from?.id);
-}
 
 // ---------- inline button (callback query) handler ----------
 bot.on('callback_query', async (query) => {
@@ -312,11 +408,37 @@ bot.on('callback_query', async (query) => {
       return;
     }
 
+    if (data === 'menu_agents') {
+      await bot.answerCallbackQuery(query.id);
+      registry.initDefaultAgents();
+      const list = registry.list().map((a) => `• ${a.name} — ${a.description}`).join('\n');
+      await bot.editMessageText(`🤖 *ایجنت‌های متصل:*\n\n${list}\n\nبرای جستجو با ایجنت: \`/agents <عبارت>\``, {
+        chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: mainMenuKeyboard(msg)
+      });
+      return;
+    }
+
     if (data === 'menu_stats') {
       await bot.answerCallbackQuery(query.id);
       const s = index.stats();
       const lines = Object.entries(s.byCat).map(([c, n]) => `• #${c}: ${n}`).join('\n');
       await bot.editMessageText(`📊 *آرشیو:* ${s.total} فایل\n\n${lines || '—'}`, {
+        chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: mainMenuKeyboard(msg)
+      });
+      return;
+    }
+
+    if (data === 'menu_setai') {
+      if (!allowlist.isOwner(query.from.id)) {
+        await bot.answerCallbackQuery(query.id, { text: '⛔ فقط مالک' });
+        return;
+      }
+      await bot.answerCallbackQuery(query.id);
+      const has = ai.hasAi();
+      const txt = has
+        ? '🤖 *کلید هوش مصنوعی تنظیم شده است.*\nبرای تغییر: `/setai <کلید>`\nحذف: `/setai off`'
+        : '🤖 برای فعال‌سازی تشخیص خودکار، کلید AI اضافه کن:\n\n`/setai <کلید Gemini>`\n`/setai openai <کلید>`';
+      await bot.editMessageText(txt, {
         chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: mainMenuKeyboard(msg)
       });
       return;
@@ -343,11 +465,13 @@ bot.on('callback_query', async (query) => {
 });
 
 // ---------- boot ----------
+registry.initDefaultAgents();
 if (!cfg.channelId || cfg.channelId === 'REPLACE_ME') {
   console.error('❌ CHANNEL_ID not set');
 } else {
   console.log('🤖 Bot started. Access control enabled.');
   console.log('   Owners:', allowlist.list().owners.length);
+  console.log('   AI key:', ai.hasAi() ? 'set' : 'not set');
 }
 
 module.exports = bot;
