@@ -25,8 +25,13 @@ function isCommand(text, name) {
 }
 
 // ---------- helpers ----------
-async function reply(chatId, text, parse = 'Markdown') {
-  try { await bot.sendMessage(chatId, text, { parse_mode: parse }); } catch (e) { /* ignore */ }
+async function reply(chatId, text, parse = 'Markdown', keyboard) {
+  try {
+    await bot.sendMessage(chatId, text, {
+      parse_mode: parse,
+      reply_markup: keyboard,
+    });
+  } catch (e) { /* ignore */ }
 }
 
 function extractFileId(msg) {
@@ -102,7 +107,9 @@ async function handleMedia(msg) {
     const ref = rec.messageId;
     reply(
       msg.chat.id,
-      `✅ ذخیره شد. (#${category})\nشناسه: \`${ref}\`\nبرای بازیابی: \`/get ${ref}\``
+      `✅ ذخیره شد. (#${category})\nشناسه: \`${ref}\`\nبرای دریافت: دکمه زیر 👇`,
+      'Markdown',
+      savedKeyboard(ref)
     );
   } catch (e) {
     reply(msg.chat.id, '❌ خطا در ذخیره. مطمئن شو CHANNEL_ID درست است.');
@@ -143,23 +150,61 @@ function handleStats(msg) {
 }
 
 // ---------- start / help ----------
-function handleHelp(msg) {
+function handleHelp(msg, customText) {
   const help = [
     '🤖 *ربات آرشیو*',
     '',
     '▪️ عکس/فایل بفرست → خودکار دسته‌بندی و در کانال ذخیره می‌شود',
     '',
-    '*دستورها:*',
-    '`/get <شناسه>` — دریافت فایل',
-    '`/search <کلمه>` — جستجو',
-    '`/stats` — آمار',
-    '',
-    '*فقط مالک:*',
-    '`/adduser @username` — افزودن کاربر',
-    '`/removeuser @username` — حذف کاربر',
-    '`/listusers` — لیست کاربران',
+    '*منوی اصلی:*',
+    'از دکمه‌های زیر استفاده کن ⬇️',
   ];
-  reply(msg.chat.id, help.join('\n'));
+  reply(msg.chat.id, customText || help.join('\n'), 'HTML', mainMenuKeyboard(msg));
+}
+
+// ---------- inline keyboard: main menu ----------
+function mainMenuKeyboard(msg) {
+  const rows = [
+    [{ text: '🔍 جستجو', callback_data: 'menu_search' }, { text: '📊 آمار', callback_data: 'menu_stats' }],
+    [{ text: '📚 دسته‌بندی‌ها', callback_data: 'menu_categories' }],
+  ];
+  if (guardOwner(msg)) {
+    rows.push([
+      { text: '👥 کاربران', callback_data: 'menu_users' },
+    ]);
+  }
+  return { inline_keyboard: rows };
+}
+
+// ---------- inline keyboard: categories ----------
+const ALL_CATEGORIES = ['کارت_ملی', 'پاسپورت', 'شناسنامه', 'مدرک_تحصیلی', 'قرارداد', 'فاکتور', 'قبض', 'عکس_شخصی', 'سایر'];
+
+function categoriesKeyboard() {
+  const rows = [];
+  for (let i = 0; i < ALL_CATEGORIES.length; i += 2) {
+    rows.push(ALL_CATEGORIES.slice(i, i + 2).map((c) => ({ text: '#' + c, callback_data: 'cat_' + c })));
+  }
+  rows.push([{ text: '🏠 بازگشت', callback_data: 'menu_back' }]);
+  return { inline_keyboard: rows };
+}
+
+// ---------- inline keyboard: saved confirmation ----------
+function savedKeyboard(messageId) {
+  return {
+    inline_keyboard: [
+      [{ text: '🔁 دریافت مجدد', callback_data: 'get_' + messageId }],
+      [{ text: '🏠 منو', callback_data: 'menu_back' }],
+    ],
+  };
+}
+
+function usersKeyboard() {
+  const l = allowlist.list();
+  return {
+    inline_keyboard: [
+      [{ text: '🏠 بازگشت', callback_data: 'menu_back' }],
+    ],
+  };
 }
 
 // ---------- router ----------
@@ -194,6 +239,108 @@ bot.on('message', async (msg) => {
 function isAllowedAny(msg) {
   return allowlist.isAllowed(msg.from?.id);
 }
+
+// ---------- inline button (callback query) handler ----------
+bot.on('callback_query', async (query) => {
+  const chatId = query.message?.chat?.id;
+  const msg = query.message;
+  const data = query.data || '';
+
+  try {
+    // Access control for callbacks
+    if (!allowlist.isAllowed(query.from.id)) {
+      await bot.answerCallbackQuery(query.id, { text: '⛔ مجاز نیستید' });
+      return;
+    }
+
+    if (data === 'menu_back') {
+      await bot.answerCallbackQuery(query.id);
+      await bot.editMessageText('🤖 *منوی اصلی ربات آرشیو*\n\nاز دکمه‌های زیر استفاده کن:', {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: mainMenuKeyboard(msg),
+      });
+      return;
+    }
+
+    if (data === 'menu_categories') {
+      await bot.answerCallbackQuery(query.id);
+      await bot.editMessageText('📚 *دسته‌بندی‌ها*\n\nروی یک دسته بزن تا فایل‌هایش را ببینی:', {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: categoriesKeyboard(),
+      });
+      return;
+    }
+
+    if (data.startsWith('cat_')) {
+      const cat = data.slice(4);
+      await bot.answerCallbackQuery(query.id);
+      const results = index.search({ category: cat });
+      if (!results.length) {
+        await bot.editMessageText(`🔍 در دسته #${cat} چیزی نیست.`, {
+          chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: categoriesKeyboard()
+        });
+      } else {
+        const text = results.slice(0, 8).map((r) =>
+          `• \`${r.messageId}\` — ${r.caption || ''} (${new Date(r.timestamp).toLocaleDateString('fa-IR')})`
+        ).join('\n');
+        await bot.editMessageText(`#${cat}\n${text}\n\nبرای دریافت: /get <شناسه>`, {
+          chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: categoriesKeyboard()
+        });
+      }
+      return;
+    }
+
+    if (data.startsWith('get_')) {
+      const messageId = Number(data.slice(4));
+      await bot.answerCallbackQuery(query.id, { text: 'در حال دریافت...' });
+      const rec = index.findByMessageId(messageId);
+      if (!rec) {
+        await bot.sendMessage(chatId, '❌ فایل پیدا نشد.');
+        return;
+      }
+      await channel.fetchFile(bot, chatId, rec.messageId);
+      return;
+    }
+
+    if (data === 'menu_search') {
+      await bot.answerCallbackQuery(query.id, { text: 'کلمه‌ی جستجو را تایپ کن: /search <کلمه>' });
+      await bot.sendMessage(chatId, '🔍 کلمه‌ی جستجو را تایپ کن:\n`/search <کلمه>`', { parse_mode: 'Markdown', reply_markup: mainMenuKeyboard(msg) });
+      return;
+    }
+
+    if (data === 'menu_stats') {
+      await bot.answerCallbackQuery(query.id);
+      const s = index.stats();
+      const lines = Object.entries(s.byCat).map(([c, n]) => `• #${c}: ${n}`).join('\n');
+      await bot.editMessageText(`📊 *آرشیو:* ${s.total} فایل\n\n${lines || '—'}`, {
+        chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: mainMenuKeyboard(msg)
+      });
+      return;
+    }
+
+    if (data === 'menu_users') {
+      if (!allowlist.isOwner(query.from.id)) {
+        await bot.answerCallbackQuery(query.id, { text: '⛔ فقط مالک' });
+        return;
+      }
+      await bot.answerCallbackQuery(query.id);
+      const l = allowlist.list();
+      const fmt = (ids) => ids.length ? ids.map((i) => `• \`${i}\``).join('\n') : '—';
+      await bot.editMessageText(`👑 *Owners:*\n${fmt(l.owners)}\n\n👤 *Users:*\n${fmt(l.users)}\n\nبرای اضافه: /adduser @username`, {
+        chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown', reply_markup: usersKeyboard()
+      });
+      return;
+    }
+
+    await bot.answerCallbackQuery(query.id);
+  } catch (e) {
+    try { await bot.answerCallbackQuery(query.id, { text: '❌ خطا' }); } catch (_E) {}
+  }
+});
 
 // ---------- boot ----------
 if (!cfg.channelId || cfg.channelId === 'REPLACE_ME') {
